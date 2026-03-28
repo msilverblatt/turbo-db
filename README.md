@@ -1,13 +1,13 @@
-# turbo-db
+# turboquant-db
 
 Lightweight embedded vector database built on [turboquant-py](https://github.com/msilverblatt/turboquant-py). Drop-in replacement for ChromaDB with 16x vector compression.
 
-turbo-db stores vectors using TurboQuant's near-optimal quantization (1-4 bits per coordinate) and metadata in SQLite. It provides a ChromaDB-compatible API with collections, metadata filtering, and concurrent read/write support — all in a few hundred lines of Python with no dependencies beyond turboquant-py and the standard library.
+turboquant-db stores vectors using TurboQuant's near-optimal quantization (1-4 bits per coordinate) and metadata in SQLite. It provides a ChromaDB-compatible API with collections, metadata filtering, and concurrent read/write support — all in a few hundred lines of Python with no dependencies beyond turboquant-py and the standard library.
 
 ## Installation
 
 ```bash
-pip install turbo-db
+pip install turboquant-db
 ```
 
 ## Quick Start
@@ -264,7 +264,7 @@ collection = client.create_collection("docs")
 collection.add(ids=["a"], embeddings=[[1, 2, 3]], metadatas=[{"k": "v"}])
 results = collection.query(query_embeddings=[[1, 2, 3]], n_results=5)
 
-# After (turbo-db)
+# After (turboquant-db)
 from turbodb import TurboDB
 db = TurboDB("./db")
 collection = db.create_collection("docs", dim=3)
