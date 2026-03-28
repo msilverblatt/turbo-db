@@ -6,16 +6,16 @@ Search images using natural language, powered by CLIP + turboquant-db.
 
 ```bash
 pip install -r requirements.txt
-python download_demo_images.py
-python app.py --images ./demo_images
+python download_demo_images.py          # downloads 200 diverse images from Unsplash
+python app.py --images ./demo_images    # launches search UI at localhost:5000
 ```
 
 Then open http://localhost:5000 and start searching.
 
 ## How it works
 
-1. `download_demo_images.py` downloads ~90 Creative Commons images from Unsplash spanning nature, animals, food, cities, people, and more
-2. `app.py` encodes each image with CLIP, stores the embeddings in turboquant-db (3-bit quantization, ~5x smaller than full precision)
+1. `download_demo_images.py` pulls metadata from the [Unsplash Research Dataset Lite](https://unsplash.com/data/lite) (25K photos), selects a diverse subset across categories (nature, animals, food, cities, people, sports, etc.), and downloads them at 640px
+2. `app.py` encodes each image with [CLIP](https://openai.com/research/clip), stores the embeddings in turboquant-db (3-bit quantization)
 3. When you type a query, it's encoded with CLIP and matched against the stored embeddings
 
 ## Example queries
@@ -29,8 +29,19 @@ Then open http://localhost:5000 and start searching.
 - "colorful flowers"
 - "person climbing a rock"
 
-## Use your own images
+## Options
 
 ```bash
+# Download more images for better results
+python download_demo_images.py --num-images 500
+
+# Use your own photos
 python app.py --images /path/to/your/photos
+
+# Change port
+python app.py --images ./demo_images --port 8080
 ```
+
+## Dataset
+
+Images are sourced from the [Unsplash Research Dataset Lite](https://unsplash.com/data/lite) under the [Unsplash Dataset License](https://unsplash.com/data/lite/license). If you have the zip already downloaded at `~/Downloads/Unsplash Research Dataset Lite.zip`, the script will use it automatically instead of re-downloading.

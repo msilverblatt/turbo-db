@@ -1,1 +1,3 @@
 demo_images/
+.dataset_cache/
+.turbodb_index/
