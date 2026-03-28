@@ -42,8 +42,14 @@ def encode_image(image_path: Path, model, processor) -> np.ndarray:
     image = Image.open(image_path).convert("RGB")
     inputs = processor(images=image, return_tensors="pt")
     with torch.no_grad():
-        features = model.get_image_features(**inputs)
-    embedding = features.numpy().flatten().astype(np.float64)
+        output = model.get_image_features(**inputs)
+        if hasattr(output, "pooler_output"):
+            features = output.pooler_output
+        elif hasattr(output, "image_embeds"):
+            features = output.image_embeds
+        else:
+            features = output
+    embedding = features.detach().cpu().numpy().flatten().astype(np.float64)
     norm = np.linalg.norm(embedding)
     if norm > 0:
         embedding = embedding / norm
@@ -54,8 +60,14 @@ def encode_text(text: str, model, processor) -> np.ndarray:
     """Encode a text query to a CLIP embedding."""
     inputs = processor(text=text, return_tensors="pt", padding=True, truncation=True)
     with torch.no_grad():
-        features = model.get_text_features(**inputs)
-    embedding = features.numpy().flatten().astype(np.float64)
+        output = model.get_text_features(**inputs)
+        if hasattr(output, "pooler_output"):
+            features = output.pooler_output
+        elif hasattr(output, "text_embeds"):
+            features = output.text_embeds
+        else:
+            features = output
+    embedding = features.detach().cpu().numpy().flatten().astype(np.float64)
     norm = np.linalg.norm(embedding)
     if norm > 0:
         embedding = embedding / norm
