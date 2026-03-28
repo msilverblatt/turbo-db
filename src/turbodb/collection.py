@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import secrets
 import shutil
-from pathlib import Path
-from typing import Any
+import threading
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from numpy.typing import NDArray
 from turboquant import CompressedVectors, TurboQuant
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from numpy.typing import NDArray
 
 from turbodb.exceptions import DimensionMismatchError
 from turbodb.filters import compile_filter
@@ -26,6 +30,7 @@ class Collection:
     def __init__(self, path: Path, name: str) -> None:
         self._path = path
         self._name = name
+        self._rw_lock = threading.RLock()
         self._meta = MetadataStore(path / "metadata.db")
         config = self._meta.get_config()
         self._dim: int = config["dim"]
@@ -112,7 +117,7 @@ class Collection:
         vectors = np.asarray(vectors, dtype=np.float64)
         self._validate_add_inputs(ids, vectors, metadatas)
 
-        with FileLock(self._path / "lock"):
+        with FileLock(self._path / "lock"), self._rw_lock:
             if self._metric == "cosine":
                 norms = np.linalg.norm(vectors, axis=1, keepdims=True)
                 norms = np.where(norms == 0, 1.0, norms)
@@ -145,7 +150,7 @@ class Collection:
         vectors = np.asarray(vectors, dtype=np.float64)
         self._validate_add_inputs(ids, vectors, metadatas)
 
-        with FileLock(self._path / "lock"):
+        with FileLock(self._path / "lock"), self._rw_lock:
             if self._metric == "cosine":
                 norms = np.linalg.norm(vectors, axis=1, keepdims=True)
                 norms = np.where(norms == 0, 1.0, norms)
@@ -178,29 +183,32 @@ class Collection:
         """Search for similar vectors."""
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
-        if self._vectors is None or self.count() == 0:
-            return to_chroma_format([]) if format == "chroma" else []
 
-        vector = np.asarray(vector, dtype=np.float64)
-        if vector.shape[-1] != self._dim:
-            raise DimensionMismatchError(self._dim, vector.shape[-1])
+        with self._rw_lock:
+            if self._vectors is None or self.count() == 0:
+                return to_chroma_format([]) if format == "chroma" else []
 
-        if self._metric == "cosine":
-            norm = np.linalg.norm(vector)
-            if norm > 0:
-                vector = vector / norm
+            vector = np.asarray(vector, dtype=np.float64)
+            if vector.shape[-1] != self._dim:
+                raise DimensionMismatchError(self._dim, vector.shape[-1])
 
-        # Get all scores
-        scores = self._quantizer.inner_product(vector, self._vectors)
+            if self._metric == "cosine":
+                norm = np.linalg.norm(vector)
+                if norm > 0:
+                    vector = vector / norm
 
-        # Get valid positions
-        live_positions = set(self._meta.get_all_live_positions())
-        if where:
-            where_clause, params = compile_filter(where)
-            filtered_positions = set(self._meta.get_positions_by_filter(where_clause, params))
-            valid_positions = live_positions & filtered_positions
-        else:
-            valid_positions = live_positions
+            # Snapshot vectors and live positions atomically
+            vectors_snapshot = self._vectors
+            live_positions = set(self._meta.get_all_live_positions())
+            if where:
+                where_clause, params = compile_filter(where)
+                filtered_positions = set(self._meta.get_positions_by_filter(where_clause, params))
+                valid_positions = live_positions & filtered_positions
+            else:
+                valid_positions = live_positions
+
+        # Get all scores (can run outside lock using snapshot)
+        scores = self._quantizer.inner_product(vector, vectors_snapshot)
 
         # Mask invalid positions
         mask = np.zeros(len(scores), dtype=bool)
@@ -232,7 +240,7 @@ class Collection:
             score = float(scores[idx])
             if self._metric == "l2":
                 query_norm = float(np.linalg.norm(vector))
-                vec_norm = float(self._vectors.norms[pos])
+                vec_norm = float(vectors_snapshot.norms[pos])
                 score = query_norm**2 + vec_norm**2 - 2 * score
             results.append(QueryResult(id=row["id"], score=score, metadata=row["metadata"]))
 
@@ -253,7 +261,7 @@ class Collection:
         if ids is None and where is None:
             raise ValueError("Must provide ids or where to delete")
 
-        with FileLock(self._path / "lock"):
+        with FileLock(self._path / "lock"), self._rw_lock:
             if ids is not None:
                 self._meta.delete_by_ids(ids)
             if where is not None:
@@ -265,7 +273,7 @@ class Collection:
         if self._vectors is None:
             return
 
-        with FileLock(self._path / "lock"):
+        with FileLock(self._path / "lock"), self._rw_lock:
             live_positions = self._meta.get_all_live_positions()
             if not live_positions:
                 self._vectors = None
