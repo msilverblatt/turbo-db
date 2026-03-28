@@ -176,7 +176,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download demo images from Unsplash Research Dataset Lite"
     )
-    parser.add_argument("--num-images", type=int, default=200, help="Number of images (default: 200)")
+    parser.add_argument("--num-images", type=int, default=2000, help="Number of images (default: 2000)")
     parser.add_argument(
         "--output",
         default=str(Path(__file__).parent / "demo_images"),
