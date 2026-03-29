@@ -197,7 +197,6 @@ class Collection:
                 if norm > 0:
                     vector = vector / norm
 
-            # Snapshot vectors and live positions atomically
             vectors_snapshot = self._vectors
             live_positions = set(self._meta.get_all_live_positions())
             if where:
@@ -207,42 +206,45 @@ class Collection:
             else:
                 valid_positions = live_positions
 
-        # Get all scores (can run outside lock using snapshot)
-        scores = self._quantizer.inner_product(vector, vectors_snapshot)
+            # Score computation must stay under the lock because
+            # concurrent add() calls overwrite vector files on disk,
+            # which invalidates any lazy/memory-mapped references held
+            # by the snapshot.
+            scores = self._quantizer.inner_product(vector, vectors_snapshot)
 
-        # Mask invalid positions
-        mask = np.zeros(len(scores), dtype=bool)
-        for pos in valid_positions:
-            if pos < len(mask):
-                mask[pos] = True
-        scores[~mask] = -np.inf
+            # Mask invalid positions
+            mask = np.zeros(len(scores), dtype=bool)
+            for pos in valid_positions:
+                if pos < len(mask):
+                    mask[pos] = True
+            scores[~mask] = -np.inf
 
-        # Top-k
-        effective_k = min(k, int(mask.sum()))
-        if effective_k == 0:
-            return to_chroma_format([]) if format == "chroma" else []
+            # Top-k
+            effective_k = min(k, int(mask.sum()))
+            if effective_k == 0:
+                return to_chroma_format([]) if format == "chroma" else []
 
-        top_indices = np.argpartition(scores, -effective_k)[-effective_k:]
-        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+            top_indices = np.argpartition(scores, -effective_k)[-effective_k:]
+            top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
 
-        # Look up metadata
-        position_to_meta = {
-            r["position"]: r
-            for r in self._meta.get_by_positions(top_indices.tolist())
-        }
+            # Look up metadata
+            position_to_meta = {
+                r["position"]: r
+                for r in self._meta.get_by_positions(top_indices.tolist())
+            }
 
-        results = []
-        for idx in top_indices:
-            pos = int(idx)
-            row = position_to_meta.get(pos)
-            if row is None:
-                continue
-            score = float(scores[idx])
-            if self._metric == "l2":
-                query_norm = float(np.linalg.norm(vector))
-                vec_norm = float(vectors_snapshot.norms[pos])
-                score = query_norm**2 + vec_norm**2 - 2 * score
-            results.append(QueryResult(id=row["id"], score=score, metadata=row["metadata"]))
+            results = []
+            for idx in top_indices:
+                pos = int(idx)
+                row = position_to_meta.get(pos)
+                if row is None:
+                    continue
+                score = float(scores[idx])
+                if self._metric == "l2":
+                    query_norm = float(np.linalg.norm(vector))
+                    vec_norm = float(vectors_snapshot.norms[pos])
+                    score = query_norm**2 + vec_norm**2 - 2 * score
+                results.append(QueryResult(id=row["id"], score=score, metadata=row["metadata"]))
 
         if format == "chroma":
             return to_chroma_format(results)
