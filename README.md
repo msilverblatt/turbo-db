@@ -69,27 +69,31 @@ collection = db.create_collection("docs", dim=384, metric="cosine", bit_width=2)
 
 **Methods:**
 
-#### `add(ids, vectors, metadatas)`
+#### `add(ids, vectors, metadatas, documents)`
 
-Add vectors with string IDs and metadata dicts. IDs must be unique.
+Add vectors with string IDs, metadata dicts, and optional document text. IDs must be unique.
 
 ```python
 collection.add(
     ids=["doc1", "doc2"],
     vectors=np.random.randn(2, 384),
     metadatas=[{"source": "wiki"}, {"source": "arxiv"}],
+    documents=["The quick brown fox...", "A study of neural networks..."],
 )
 ```
 
-#### `upsert(ids, vectors, metadatas)`
+The `documents` parameter is optional. When provided, document text is indexed for BM25 keyword search via `hybrid_query()`.
 
-Insert or replace vectors. If an ID already exists, its vector and metadata are replaced.
+#### `upsert(ids, vectors, metadatas, documents)`
+
+Insert or replace vectors. If an ID already exists, its vector, metadata, and document are replaced.
 
 ```python
 collection.upsert(
     ids=["doc1"],
     vectors=new_vector,
     metadatas=[{"source": "updated"}],
+    documents=["Updated document text."],
 )
 ```
 
@@ -105,6 +109,40 @@ results[0].metadata  # {"source": "arxiv"}
 ```
 
 Returns a list of `QueryResult` objects sorted by descending score.
+
+#### `hybrid_query(text, vector, k, fusion, alpha, where, format)`
+
+Hybrid search combining BM25 keyword matching with vector similarity. Requires documents to have been passed to `add()` or `upsert()`.
+
+```python
+results = collection.hybrid_query(
+    text="quick fox",
+    vector=query_vec,
+    k=10,
+    fusion="rrf",        # "rrf", "weighted", or "dbsf"
+    alpha=0.5,           # only used when fusion="weighted"
+)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `text` | `str` | required | Query text for BM25 scoring |
+| `vector` | array-like | `None` | Query vector for semantic scoring. If omitted, performs pure BM25 |
+| `k` | `int` | `10` | Number of results |
+| `fusion` | `str` | `"rrf"` | Fusion strategy (see below) |
+| `alpha` | `float` | `0.5` | Vector weight for `"weighted"` fusion. 1.0 = pure vector, 0.0 = pure BM25 |
+| `where` | `dict` | `None` | Metadata filter |
+| `format` | `str` | `None` | `"chroma"` for ChromaDB format |
+
+**Fusion strategies:**
+
+| Strategy | Description | When to use |
+|---|---|---|
+| `"rrf"` | Reciprocal Rank Fusion (Cormack et al.) — combines rankings, ignores raw scores | Default. Zero tuning required, solid out-of-the-box |
+| `"weighted"` | Convex combination with min-max normalization | Best accuracy when `alpha` is tuned per dataset |
+| `"dbsf"` | Distribution-Based Score Fusion — normalizes via mean ± 3·stddev | Robust to score outliers without tuning |
+
+Per Kuzi et al. (ACM TOIS 2023), `"weighted"` outperforms `"rrf"` when alpha is tuned — even ~50 labeled query pairs suffice.
 
 #### `get(ids)`
 
@@ -145,13 +183,14 @@ collection.metric    # "cosine"
 
 ### `QueryResult`
 
-Frozen dataclass returned by `query()`.
+Frozen dataclass returned by `query()` and `hybrid_query()`.
 
 | Attribute | Type | Description |
 |---|---|---|
 | `id` | `str` | Vector ID |
 | `score` | `float` | Similarity score (higher = more similar for cosine/ip) |
 | `metadata` | `dict` | Associated metadata |
+| `document` | `str \| None` | Document text, if stored |
 
 ---
 

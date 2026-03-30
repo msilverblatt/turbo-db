@@ -15,8 +15,10 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
+from turbodb.bm25 import BM25Index
 from turbodb.exceptions import DimensionMismatchError
 from turbodb.filters import compile_filter
+from turbodb.fusion import fuse_dbsf, fuse_rrf, fuse_weighted
 from turbodb.locking import FileLock
 from turbodb.metadata import MetadataStore
 from turbodb.results import QueryResult, to_chroma_format
@@ -45,6 +47,7 @@ class Collection:
         )
         self._vectors: CompressedVectors | None = None
         self._load_vectors()
+        self._bm25 = BM25Index(path)
 
     @classmethod
     def create(
@@ -104,6 +107,15 @@ class Collection:
     def metric(self) -> str:
         return self._metric
 
+    @property
+    def tokenizer(self):
+        """The tokenizer function used for BM25 indexing and search."""
+        return self._bm25._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, func):
+        self._bm25._tokenizer = func
+
     def count(self) -> int:
         return self._meta.count()
 
@@ -112,10 +124,15 @@ class Collection:
         ids: list[str],
         vectors: NDArray,
         metadatas: list[dict[str, Any]],
+        documents: list[str] | None = None,
     ) -> None:
-        """Add vectors with IDs and metadata."""
+        """Add vectors with IDs, metadata, and optional document text."""
         vectors = np.asarray(vectors, dtype=np.float64)
         self._validate_add_inputs(ids, vectors, metadatas)
+        if documents is not None and len(documents) != len(ids):
+            raise ValueError(
+                f"Length mismatch: {len(ids)} ids but {len(documents)} documents"
+            )
 
         with FileLock(self._path / "lock"), self._rw_lock:
             if self._metric == "cosine":
@@ -138,17 +155,35 @@ class Collection:
                 (ids[i], start_pos + i, metadatas[i])
                 for i in range(len(ids))
             ]
-            self._meta.insert_batch(rows)
+            self._meta.insert_batch(rows, documents=documents)
+
+            # Update BM25 index
+            if documents is not None:
+                docs_to_index = [
+                    (start_pos + i, doc)
+                    for i, doc in enumerate(documents)
+                    if doc
+                ]
+                if docs_to_index:
+                    self._bm25.add(
+                        [pos for pos, _ in docs_to_index],
+                        [doc for _, doc in docs_to_index],
+                    )
 
     def upsert(
         self,
         ids: list[str],
         vectors: NDArray,
         metadatas: list[dict[str, Any]],
+        documents: list[str] | None = None,
     ) -> None:
         """Insert or replace vectors."""
         vectors = np.asarray(vectors, dtype=np.float64)
         self._validate_add_inputs(ids, vectors, metadatas)
+        if documents is not None and len(documents) != len(ids):
+            raise ValueError(
+                f"Length mismatch: {len(ids)} ids but {len(documents)} documents"
+            )
 
         with FileLock(self._path / "lock"), self._rw_lock:
             if self._metric == "cosine":
@@ -171,7 +206,22 @@ class Collection:
                 (ids[i], start_pos + i, metadatas[i])
                 for i in range(len(ids))
             ]
-            self._meta.upsert_batch(rows)
+            replaced = self._meta.upsert_batch(rows, documents=documents)
+
+            # Update BM25 index
+            if replaced:
+                self._bm25.remove(replaced)
+            if documents is not None:
+                docs_to_index = [
+                    (start_pos + i, doc)
+                    for i, doc in enumerate(documents)
+                    if doc
+                ]
+                if docs_to_index:
+                    self._bm25.add(
+                        [pos for pos, _ in docs_to_index],
+                        [doc for _, doc in docs_to_index],
+                    )
 
     def query(
         self,
@@ -244,7 +294,10 @@ class Collection:
                     query_norm = float(np.linalg.norm(vector))
                     vec_norm = float(vectors_snapshot.norms[pos])
                     score = query_norm**2 + vec_norm**2 - 2 * score
-                results.append(QueryResult(id=row["id"], score=score, metadata=row["metadata"]))
+                results.append(QueryResult(
+                    id=row["id"], score=score, metadata=row["metadata"],
+                    document=row.get("document"),
+                ))
 
         if format == "chroma":
             return to_chroma_format(results)
@@ -253,6 +306,145 @@ class Collection:
     def get(self, ids: list[str]) -> list[dict[str, Any]]:
         """Get metadata by IDs."""
         return self._meta.get_by_ids(ids)
+
+    def hybrid_query(
+        self,
+        text: str,
+        vector: NDArray | None = None,
+        k: int = 10,
+        fusion: str = "rrf",
+        alpha: float = 0.5,
+        where: dict[str, Any] | None = None,
+        format: str | None = None,
+    ) -> list[QueryResult] | dict:
+        """Hybrid search combining BM25 keyword matching with vector similarity.
+
+        Parameters
+        ----------
+        text : str
+            Query text for BM25 scoring.
+        vector : array-like, optional
+            Query vector for semantic scoring.  If omitted, performs pure BM25.
+        k : int
+            Number of results to return.
+        fusion : str
+            ``"rrf"`` (Reciprocal Rank Fusion, default), ``"weighted"``
+            (convex combination with min-max normalisation), or ``"dbsf"``
+            (Distribution-Based Score Fusion).
+        alpha : float
+            Vector weight when *fusion* = ``"weighted"``.
+            1.0 = pure vector, 0.0 = pure BM25.
+        where : dict, optional
+            Metadata filter (same syntax as :meth:`query`).
+        format : str, optional
+            ``"chroma"`` for ChromaDB column-oriented output.
+        """
+        if k <= 0:
+            raise ValueError(f"k must be positive, got {k}")
+
+        with self._rw_lock:
+            if self.count() == 0:
+                return to_chroma_format([]) if format == "chroma" else []
+
+            # Valid positions (live + optional metadata filter)
+            live_positions = set(self._meta.get_all_live_positions())
+            if where:
+                where_clause, params = compile_filter(where)
+                filtered = set(self._meta.get_positions_by_filter(where_clause, params))
+                valid_positions = live_positions & filtered
+            else:
+                valid_positions = live_positions
+
+            if not valid_positions:
+                return to_chroma_format([]) if format == "chroma" else []
+
+            # Ensure BM25 index is loaded / up-to-date
+            self._ensure_bm25_loaded()
+
+            # --- BM25 scoring ---
+            bm25_scores = self._bm25.search(text, valid_positions)
+            bm25_ranked: list[tuple[int, float]] = sorted(
+                bm25_scores.items(), key=lambda x: x[1], reverse=True,
+            )
+
+            # --- Vector scoring ---
+            vector_ranked: list[tuple[int, float]] = []
+            if vector is not None and self._vectors is not None:
+                vector = np.asarray(vector, dtype=np.float64)
+                if vector.shape[-1] != self._dim:
+                    raise DimensionMismatchError(self._dim, vector.shape[-1])
+                if self._metric == "cosine":
+                    norm = np.linalg.norm(vector)
+                    if norm > 0:
+                        vector = vector / norm
+
+                vectors_snapshot = self._vectors
+                raw_scores = self._quantizer.inner_product(vector, vectors_snapshot)
+
+                for pos in valid_positions:
+                    if pos < len(raw_scores):
+                        score = float(raw_scores[pos])
+                        if self._metric == "l2":
+                            qn = float(np.linalg.norm(vector))
+                            vn = float(vectors_snapshot.norms[pos])
+                            score = -(qn**2 + vn**2 - 2 * score)
+                        vector_ranked.append((pos, score))
+                vector_ranked.sort(key=lambda x: x[1], reverse=True)
+
+            # --- Fusion ---
+            fetch_n = max(k * 5, 50)
+            if vector_ranked and bm25_ranked:
+                top_v = vector_ranked[:fetch_n]
+                top_b = bm25_ranked[:fetch_n]
+                if fusion == "rrf":
+                    fused = fuse_rrf(top_v, top_b, k)
+                elif fusion == "weighted":
+                    fused = fuse_weighted(top_v, top_b, k, alpha)
+                elif fusion == "dbsf":
+                    fused = fuse_dbsf(top_v, top_b, k)
+                else:
+                    raise ValueError(f"Unknown fusion method: {fusion!r}")
+            elif vector_ranked:
+                fused = vector_ranked[:k]
+            elif bm25_ranked:
+                fused = bm25_ranked[:k]
+            else:
+                return to_chroma_format([]) if format == "chroma" else []
+
+            # --- Build result objects ---
+            fused_positions = [pos for pos, _ in fused]
+            position_to_meta = {
+                r["position"]: r
+                for r in self._meta.get_by_positions(fused_positions)
+            }
+
+            results = []
+            for pos, score in fused:
+                row = position_to_meta.get(pos)
+                if row is None:
+                    continue
+                results.append(QueryResult(
+                    id=row["id"],
+                    score=score,
+                    metadata=row["metadata"],
+                    document=row.get("document"),
+                ))
+
+        if format == "chroma":
+            return to_chroma_format(results)
+        return results
+
+    def _ensure_bm25_loaded(self) -> None:
+        """Rebuild BM25 index from SQLite if the cache is stale or missing."""
+        doc_count = self._meta.count_documents()
+        if doc_count == 0:
+            return
+        if self._bm25.num_docs != doc_count:
+            docs = self._meta.get_all_documents()
+            self._bm25.rebuild(
+                [d["position"] for d in docs],
+                [d["document"] for d in docs],
+            )
 
     def delete(
         self,
@@ -264,11 +456,14 @@ class Collection:
             raise ValueError("Must provide ids or where to delete")
 
         with FileLock(self._path / "lock"), self._rw_lock:
+            deleted_positions: list[int] = []
             if ids is not None:
-                self._meta.delete_by_ids(ids)
+                deleted_positions.extend(self._meta.delete_by_ids(ids))
             if where is not None:
                 where_clause, params = compile_filter(where)
-                self._meta.delete_by_filter(where_clause, params)
+                deleted_positions.extend(self._meta.delete_by_filter(where_clause, params))
+            if deleted_positions:
+                self._bm25.remove(deleted_positions)
 
     def compact(self) -> None:
         """Rewrite vectors and metadata to remove dead entries."""
@@ -293,6 +488,7 @@ class Collection:
 
             position_map = {old: new for new, old in enumerate(live_set)}
             self._meta.rewrite_positions(position_map)
+            self._bm25.remap_positions(position_map)
 
             self._vectors = new_vectors
             self._vectors.save(self._path / "vectors")

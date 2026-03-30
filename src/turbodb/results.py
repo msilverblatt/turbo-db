@@ -15,6 +15,7 @@ class QueryResult:
     id: str
     score: float
     metadata: dict[str, Any]
+    document: str | None = None
 
     def __repr__(self) -> str:
         return f"QueryResult(id={self.id!r}, score={self.score:.4f}, metadata={self.metadata!r})"
@@ -28,4 +29,5 @@ def to_chroma_format(
         "ids": [[r.id for r in results]],
         "distances": [[r.score for r in results]],
         "metadatas": [[r.metadata for r in results]],
+        "documents": [[r.document for r in results]],
     }

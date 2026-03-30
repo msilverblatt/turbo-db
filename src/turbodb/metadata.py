@@ -27,7 +27,8 @@ class MetadataStore:
             CREATE TABLE IF NOT EXISTS vectors (
                 id TEXT PRIMARY KEY,
                 position INTEGER NOT NULL,
-                metadata TEXT NOT NULL DEFAULT '{}'
+                metadata TEXT NOT NULL DEFAULT '{}',
+                document TEXT DEFAULT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_position ON vectors(position);
             CREATE TABLE IF NOT EXISTS config (
@@ -35,6 +36,17 @@ class MetadataStore:
                 value TEXT NOT NULL
             );
         """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced in newer versions."""
+        cursor = self._conn.execute("PRAGMA table_info(vectors)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "document" not in columns:
+            self._conn.execute(
+                "ALTER TABLE vectors ADD COLUMN document TEXT DEFAULT NULL"
+            )
+            self._conn.commit()
 
     def insert(self, id: str, position: int, metadata: dict[str, Any]) -> None:
         self._conn.execute(
@@ -43,30 +55,51 @@ class MetadataStore:
         )
         self._conn.commit()
 
-    def insert_batch(self, rows: list[tuple[str, int, dict[str, Any]]]) -> None:
-        self._conn.executemany(
-            "INSERT INTO vectors (id, position, metadata) VALUES (?, ?, ?)",
-            [(id, pos, json.dumps(meta)) for id, pos, meta in rows],
-        )
+    def insert_batch(
+        self,
+        rows: list[tuple[str, int, dict[str, Any]]],
+        documents: list[str | None] | None = None,
+    ) -> None:
+        if documents is not None:
+            self._conn.executemany(
+                "INSERT INTO vectors (id, position, metadata, document)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    (id, pos, json.dumps(meta), doc)
+                    for (id, pos, meta), doc in zip(rows, documents, strict=True)
+                ],
+            )
+        else:
+            self._conn.executemany(
+                "INSERT INTO vectors (id, position, metadata) VALUES (?, ?, ?)",
+                [(id, pos, json.dumps(meta)) for id, pos, meta in rows],
+            )
         self._conn.commit()
 
-    def upsert_batch(self, rows: list[tuple[str, int, dict[str, Any]]]) -> list[int]:
+    def upsert_batch(
+        self,
+        rows: list[tuple[str, int, dict[str, Any]]],
+        documents: list[str | None] | None = None,
+    ) -> list[int]:
         """Insert or replace rows. Returns positions of replaced rows."""
         replaced_positions = []
-        for id, pos, meta in rows:
+        for i, (id, pos, meta) in enumerate(rows):
             row = self._conn.execute(
                 "SELECT position FROM vectors WHERE id = ?", (id,)
             ).fetchone()
+            doc = documents[i] if documents is not None else None
             if row is not None:
                 replaced_positions.append(row["position"])
                 self._conn.execute(
-                    "UPDATE vectors SET position = ?, metadata = ? WHERE id = ?",
-                    (pos, json.dumps(meta), id),
+                    "UPDATE vectors SET position = ?, metadata = ?, document = ?"
+                    " WHERE id = ?",
+                    (pos, json.dumps(meta), doc, id),
                 )
             else:
                 self._conn.execute(
-                    "INSERT INTO vectors (id, position, metadata) VALUES (?, ?, ?)",
-                    (id, pos, json.dumps(meta)),
+                    "INSERT INTO vectors (id, position, metadata, document)"
+                    " VALUES (?, ?, ?, ?)",
+                    (id, pos, json.dumps(meta), doc),
                 )
         self._conn.commit()
         return replaced_positions
@@ -127,12 +160,17 @@ class MetadataStore:
     def get_by_positions(self, positions: list[int]) -> list[dict[str, Any]]:
         placeholders = ", ".join("?" for _ in positions)
         rows = self._conn.execute(
-            f"SELECT id, position, metadata FROM vectors WHERE position IN ({placeholders})"
-            f" ORDER BY position",
+            f"SELECT id, position, metadata, document FROM vectors"
+            f" WHERE position IN ({placeholders}) ORDER BY position",
             positions,
         ).fetchall()
         return [
-            {"id": r["id"], "position": r["position"], "metadata": json.loads(r["metadata"])}
+            {
+                "id": r["id"],
+                "position": r["position"],
+                "metadata": json.loads(r["metadata"]),
+                "document": r["document"],
+            }
             for r in rows
         ]
 
@@ -171,6 +209,21 @@ class MetadataStore:
                 (new_pos, old_pos),
             )
         self._conn.commit()
+
+    def get_all_documents(self) -> list[dict[str, Any]]:
+        """Return all rows that have a non-NULL document."""
+        rows = self._conn.execute(
+            "SELECT position, document FROM vectors"
+            " WHERE document IS NOT NULL ORDER BY position"
+        ).fetchall()
+        return [{"position": r["position"], "document": r["document"]} for r in rows]
+
+    def count_documents(self) -> int:
+        """Count rows that have a non-NULL document."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) as n FROM vectors WHERE document IS NOT NULL"
+        ).fetchone()
+        return row["n"]
 
     def close(self) -> None:
         self._conn.close()

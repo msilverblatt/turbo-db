@@ -1,5 +1,6 @@
 """turbo-db: Lightweight embedded vector database built on TurboQuant."""
 
+from turbodb.bm25 import default_tokenizer
 from turbodb.collection import Collection
 from turbodb.db import TurboDB
 from turbodb.exceptions import (
@@ -20,6 +21,7 @@ __all__ = [
     "QueryResult",
     "TurboDB",
     "TurboDBError",
+    "default_tokenizer",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
