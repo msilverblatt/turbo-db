@@ -279,3 +279,135 @@ class TestDocumentLifecycle:
         )
         # With alpha=1.0 and no BM25 matches, hybrid should match vector ordering
         assert [r.id for r in vec_results] == [r.id for r in hybrid_results]
+
+
+class TestScoreNormalization:
+    """Fused scores should be in [0, 1] regardless of fusion method."""
+
+    @pytest.fixture
+    def scored_col(self, db):
+        rng = np.random.default_rng(42)
+        col = db.create_collection("s", dim=64)
+        vectors = rng.standard_normal((10, 64))
+        col.add(
+            ids=[f"d{i}" for i in range(10)],
+            vectors=vectors,
+            metadatas=[{} for _ in range(10)],
+            documents=[
+                "the quick brown fox jumps over the lazy dog",
+                "neural networks learn from data",
+                "the fox and the dog played together",
+                "deep learning requires compute",
+                "the lazy brown dog slept all day",
+                "attention mechanisms in transformers",
+                "brown fox ran across the field",
+                "gradient descent optimization",
+                "the quick cat chased a mouse",
+                "loss functions for classification",
+            ],
+        )
+        return col, vectors
+
+    def test_rrf_scores_0_to_1(self, scored_col):
+        col, vectors = scored_col
+        results = col.hybrid_query(
+            text="quick brown fox", vector=vectors[0], k=10, fusion="rrf",
+        )
+        for r in results:
+            assert 0.0 <= r.score <= 1.0, f"RRF score {r.score} out of [0,1]"
+
+    def test_weighted_scores_0_to_1(self, scored_col):
+        col, vectors = scored_col
+        results = col.hybrid_query(
+            text="quick brown fox", vector=vectors[0], k=10, fusion="weighted",
+        )
+        for r in results:
+            assert 0.0 <= r.score <= 1.0 + 1e-10, f"Weighted score {r.score} out of [0,1]"
+
+    def test_dbsf_scores_0_to_1(self, scored_col):
+        col, vectors = scored_col
+        results = col.hybrid_query(
+            text="quick brown fox", vector=vectors[0], k=10, fusion="dbsf",
+        )
+        for r in results:
+            assert 0.0 <= r.score <= 1.0 + 1e-10, f"DBSF score {r.score} out of [0,1]"
+
+    def test_pure_bm25_scores_0_to_1(self, scored_col):
+        col, _ = scored_col
+        results = col.hybrid_query(text="quick brown fox", k=10)
+        for r in results:
+            assert 0.0 <= r.score <= 1.0 + 1e-10, f"BM25 score {r.score} out of [0,1]"
+
+    def test_rrf_top_result_near_1(self, scored_col):
+        """A doc that is top in both retrievers should score close to 1.0."""
+        col, vectors = scored_col
+        # "quick brown fox" should strongly match doc 0 in BM25;
+        # vectors[0] is the exact vector for doc 0 — top in vector search.
+        results = col.hybrid_query(
+            text="quick brown fox", vector=vectors[0], k=1, fusion="rrf",
+        )
+        assert results[0].score > 0.8
+
+
+class TestComponentScores:
+    """vector_score and keyword_score should be populated."""
+
+    def test_hybrid_query_has_component_scores(self, db):
+        rng = np.random.default_rng(42)
+        col = db.create_collection("c", dim=64)
+        vectors = rng.standard_normal((3, 64))
+        col.add(
+            ids=["a", "b", "c"],
+            vectors=vectors,
+            metadatas=[{}, {}, {}],
+            documents=["alpha bravo", "charlie delta", "echo foxtrot"],
+        )
+        results = col.hybrid_query(text="alpha", vector=vectors[0], k=3)
+        # "a" should have a positive keyword_score (matches "alpha")
+        a_result = next(r for r in results if r.id == "a")
+        assert a_result.keyword_score > 0.0
+        assert a_result.vector_score != 0.0
+
+    def test_vector_only_has_zero_keyword_score(self, db):
+        rng = np.random.default_rng(42)
+        col = db.create_collection("c", dim=64)
+        vectors = rng.standard_normal((3, 64))
+        col.add(
+            ids=["a", "b", "c"],
+            vectors=vectors,
+            metadatas=[{}, {}, {}],
+        )
+        # No documents → vector-only fallback
+        results = col.hybrid_query(text="anything", vector=vectors[0], k=3)
+        for r in results:
+            assert r.keyword_score == 0.0
+
+    def test_query_sets_vector_score(self, db):
+        """Regular query() should set vector_score == score."""
+        rng = np.random.default_rng(42)
+        col = db.create_collection("c", dim=64)
+        vectors = rng.standard_normal((3, 64))
+        col.add(
+            ids=["a", "b", "c"],
+            vectors=vectors,
+            metadatas=[{}, {}, {}],
+        )
+        results = col.query(vector=vectors[0], k=3)
+        for r in results:
+            assert r.vector_score == r.score
+            assert r.keyword_score == 0.0
+
+    def test_bm25_only_has_zero_vector_score(self, db):
+        rng = np.random.default_rng(42)
+        col = db.create_collection("c", dim=64)
+        vectors = rng.standard_normal((3, 64))
+        col.add(
+            ids=["a", "b", "c"],
+            vectors=vectors,
+            metadatas=[{}, {}, {}],
+            documents=["alpha bravo", "charlie delta", "echo foxtrot"],
+        )
+        # Pure BM25 (no vector)
+        results = col.hybrid_query(text="alpha", k=3)
+        for r in results:
+            assert r.vector_score == 0.0

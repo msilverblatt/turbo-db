@@ -297,6 +297,7 @@ class Collection:
                 results.append(QueryResult(
                     id=row["id"], score=score, metadata=row["metadata"],
                     document=row.get("document"),
+                    vector_score=score,
                 ))
 
         if format == "chroma":
@@ -391,27 +392,44 @@ class Collection:
                         vector_ranked.append((pos, score))
                 vector_ranked.sort(key=lambda x: x[1], reverse=True)
 
-            # --- Fusion ---
+            # --- Fusion (scores normalized to 0-1) ---
             fetch_n = max(k * 5, 50)
+            rrf_k = 60
             if vector_ranked and bm25_ranked:
                 top_v = vector_ranked[:fetch_n]
                 top_b = bm25_ranked[:fetch_n]
                 if fusion == "rrf":
-                    fused = fuse_rrf(top_v, top_b, k)
+                    fused = fuse_rrf(top_v, top_b, k, rrf_k=rrf_k)
+                    max_rrf = 2.0 / (rrf_k + 1)
+                    fused = [(key, min(s / max_rrf, 1.0)) for key, s in fused]
                 elif fusion == "weighted":
                     fused = fuse_weighted(top_v, top_b, k, alpha)
                 elif fusion == "dbsf":
                     fused = fuse_dbsf(top_v, top_b, k)
+                    fused = [(key, min(s / 2.0, 1.0)) for key, s in fused]
                 else:
                     raise ValueError(f"Unknown fusion method: {fusion!r}")
             elif vector_ranked:
                 fused = vector_ranked[:k]
             elif bm25_ranked:
-                fused = bm25_ranked[:k]
+                # Normalize raw BM25 scores to [0, 1]
+                raw = bm25_ranked[:k]
+                if len(raw) <= 1:
+                    fused = [(key, 1.0) for key, _ in raw]
+                else:
+                    lo, hi = raw[-1][1], raw[0][1]
+                    span = hi - lo
+                    if span == 0:
+                        fused = [(key, 1.0) for key, _ in raw]
+                    else:
+                        fused = [(key, (s - lo) / span) for key, s in raw]
             else:
                 return to_chroma_format([]) if format == "chroma" else []
 
-            # --- Build result objects ---
+            # --- Build result objects with component scores ---
+            bm25_score_map = dict(bm25_ranked)
+            vector_score_map = dict(vector_ranked)
+
             fused_positions = [pos for pos, _ in fused]
             position_to_meta = {
                 r["position"]: r
@@ -423,11 +441,16 @@ class Collection:
                 row = position_to_meta.get(pos)
                 if row is None:
                     continue
+                raw_vec = vector_score_map.get(pos, 0.0)
+                if self._metric == "l2" and raw_vec != 0.0:
+                    raw_vec = -raw_vec  # undo negation to return actual L2 distance
                 results.append(QueryResult(
                     id=row["id"],
                     score=score,
                     metadata=row["metadata"],
                     document=row.get("document"),
+                    vector_score=raw_vec,
+                    keyword_score=bm25_score_map.get(pos, 0.0),
                 ))
 
         if format == "chroma":

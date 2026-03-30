@@ -16,6 +16,8 @@ class QueryResult:
     score: float
     metadata: dict[str, Any]
     document: str | None = None
+    vector_score: float = 0.0
+    keyword_score: float = 0.0
 
     def __repr__(self) -> str:
         return f"QueryResult(id={self.id!r}, score={self.score:.4f}, metadata={self.metadata!r})"
