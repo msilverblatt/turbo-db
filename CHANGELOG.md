@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.1
+
+- Normalize `hybrid_query()` fused scores to [0, 1] across all fusion methods
+- Add `vector_score` and `keyword_score` fields to `QueryResult` for component-level inspection
+- `query()` now sets `vector_score` equal to `score` for cross-mode consistency
+
+## 0.2.0
 
 Hybrid search combining semantic embeddings with BM25 keyword matching.
 
